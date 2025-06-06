@@ -1,0 +1,216 @@
+import telebot
+import re
+import os
+from telebot import types
+from io import BytesIO
+from bs4 import BeautifulSoup
+import openpyxl
+import pandas as pd
+
+OUTPUT_DIR = 'output_txt'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+API_TOKEN = '7922533809:AAE0UnkpfbJQkfXipLqbXj-bb5hqw7YbAXw'
+bot = telebot.TeleBot(API_TOKEN)
+user_modes = {}
+FIXED_INCOME = "140075,78"
+
+def safe_send(chat_id, text):
+    safe_text = str(text).encode("utf-8", "ignore").decode("utf-8")
+    bot.send_message(chat_id, safe_text)
+
+def normalize_date_string(date_str):
+    return re.sub(r'(г\.?\s?р\.?|г\.?|р\.?)', '', date_str, flags=re.IGNORECASE).strip()
+
+def extract_fio_date_pairs(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    results = []
+    deleted_lines = lines.copy()
+    i = 0
+    fio_pattern = re.compile(r'^[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+$')
+    date_pattern = re.compile(r'^(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})$')
+    while i < len(lines) - 1:
+        if fio_pattern.match(lines[i]):
+            date_candidate = normalize_date_string(lines[i + 1])
+            if date_pattern.match(date_candidate):
+                results.append((lines[i], date_candidate))
+                i += 2
+                continue
+        i += 1
+    return results, deleted_lines
+
+def format_income_blocks(pairs):
+    lines = []
+    for fio, date in pairs:
+        lines.append(f"ИМЯ: {fio}")
+        lines.append(f"ДАТА РОЖДЕНИЯ: {date}")
+        lines.append(f"СУММА_ГОДОВОГО_ДОХОДА: {FIXED_INCOME}")
+    return "\n".join(lines)
+
+def send_mode_selection(chat_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔘 Очистка", callback_data="mode_clean"),
+        types.InlineKeyboardButton("💰 Доход", callback_data="mode_income"),
+        types.InlineKeyboardButton("📄 Конвертация", callback_data="mode_convert")
+    )
+    bot.send_message(chat_id, "🔄 Выберите режим:", reply_markup=markup)
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_modes[message.chat.id] = 'очистка'
+    send_mode_selection(message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
+def handle_mode_buttons(call):
+    mode = call.data.split("_")[1]
+    user_modes[call.message.chat.id] = {
+        'clean': 'очистка',
+        'income': 'доход',
+        'convert': 'конвертация'
+    }.get(mode, 'очистка')
+    bot.answer_callback_query(call.id, f"✅ Режим установлен: {mode.upper()}")
+    safe_send(call.message.chat.id, f"Режим активирован: {mode.upper()}")
+
+@bot.message_handler(content_types=['document'])
+def handle_file(message):
+    mode = user_modes.get(message.chat.id, 'очистка')
+    safe_send(message.chat.id, f"📩 Файл получен. Режим: {mode.upper()}. Обработка...")
+
+    file_info = bot.get_file(message.document.file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+
+    if mode == 'конвертация' and message.document.file_name.lower().endswith(".html"):
+        soup = BeautifulSoup(downloaded_file.decode("utf-8", errors="ignore"), "html.parser")
+        bold_fios = set(tag.get_text(strip=True) for tag in soup.find_all(['b', 'strong']))
+        text_lines = soup.get_text(separator="\n", strip=True).splitlines()
+        final_blocks = []
+        i = 0
+        while i < len(text_lines):
+            line = text_lines[i].strip()
+            if line in bold_fios:
+                block = [line]
+                for j in range(1, 4):
+                    if i + j < len(text_lines):
+                        block.append(text_lines[i + j].strip())
+                final_blocks.extend(block)
+                final_blocks.append("")
+                i += 4
+            else:
+                i += 1
+        filename = "конвертация_" + message.document.file_name.replace(".html", ".txt")
+        output_path = os.path.join(OUTPUT_DIR, filename)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(final_blocks))
+        with open(output_path, "rb") as f:
+            bot.send_document(message.chat.id, f)
+        send_mode_selection(message.chat.id)
+        return
+
+    if mode == 'доход' and message.document.file_name.lower().endswith('.xlsx'):
+        excel_file = BytesIO(downloaded_file)
+        wb = openpyxl.load_workbook(excel_file)
+        ws = wb.active
+        pairs = []
+        for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
+            if not row[0]:
+                continue
+            line = str(row[0]).strip()
+            if line.upper().startswith("РЕЗУЛЬТАТЫ ДЛЯ:") or line.upper() == "ФИО":
+                continue
+            match = re.search(r"(\d{2}\.\d{2}\.\d{4})$", line)
+            if match:
+                date = match.group(1)
+                fio = line[:match.start()].strip().upper()
+                pairs.append((fio, date))
+        if not pairs:
+            bot.send_message(message.chat.id, "⚠️ Не удалось распознать данные в Excel.")
+            return
+        output = format_income_blocks(pairs)
+        bot.send_message(message.chat.id, "📄 Введите номер для файла (например, 29):")
+
+        def wait_for_number_response(msg):
+            number = msg.text.strip()
+            filename = f"messages{number} для осинта.txt"
+            output_path = os.path.join(OUTPUT_DIR, filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(output)
+            with open(output_path, 'rb') as f:
+                bot.send_message(msg.chat.id, "✅ Готово! Отправляю файл:")
+                bot.send_document(msg.chat.id, f)
+            send_mode_selection(msg.chat.id)
+
+        bot.register_next_step_handler(message, wait_for_number_response)
+        return
+
+    if mode == 'очистка':
+        if message.document.file_name.lower().endswith('.xlsx'):
+            df = pd.read_excel(BytesIO(downloaded_file))
+            df = df.dropna(subset=["ФИО", "Дата рождения"])
+            df = df[~df["Дата рождения"].astype(str).str.contains(r'\?')]
+            df["Дата рождения"] = pd.to_datetime(df["Дата рождения"], errors="coerce")
+            df = df.dropna(subset=["Дата рождения"])
+            df["Дата строка"] = df["Дата рождения"].dt.strftime("%d.%m.%Y")
+            df["combined"] = df["ФИО"].astype(str).str.strip() + " " + df["Дата строка"]
+            extracted_txt = df["combined"].tolist()
+
+            full_df = pd.read_excel(BytesIO(downloaded_file))
+            full_df["Дата рождения"] = pd.to_datetime(full_df["Дата рождения"], errors="coerce")
+            full_df["Дата строка"] = full_df["Дата рождения"].dt.strftime("%d.%m.%Y")
+            full_df["combined"] = full_df["ФИО"].astype(str).str.strip() + " " + full_df["Дата строка"]
+
+            cleaned_df = full_df[~full_df["combined"].isin(extracted_txt)].drop(columns=["combined", "Дата строка"])
+
+            txt_path = os.path.join(OUTPUT_DIR, "очистка_excel.txt")
+            excel_path = os.path.join(OUTPUT_DIR, "очищенная_таблица.xlsx")
+
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(extracted_txt))
+            cleaned_df.to_excel(excel_path, index=False)
+
+            with open(txt_path, "rb") as f:
+                bot.send_document(message.chat.id, f, caption="✅ ФИО с датами рождения")
+            with open(excel_path, "rb") as f:
+                bot.send_document(message.chat.id, f, caption="🧹 Таблица без выбранных строк")
+            send_mode_selection(message.chat.id)
+            return
+
+        # .txt обработка
+        file_lines = downloaded_file.decode('utf-8', errors='ignore').splitlines()
+        pairs, deleted_lines = extract_fio_date_pairs('\n'.join(file_lines))
+        cleaned_lines = [f'{fio} {date}' for fio, date in pairs]
+
+        clean_name = f'очистка_{message.document.file_name}'
+        clean_path = os.path.join(OUTPUT_DIR, clean_name)
+        with open(clean_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(cleaned_lines))
+        with open(clean_path, 'rb') as f:
+            bot.send_document(message.chat.id, f)
+
+        i = 0
+        while i < len(deleted_lines) - 3:
+            fio = deleted_lines[i].strip()
+            date = normalize_date_string(deleted_lines[i + 1].strip())
+            pair = f'{fio} {date}'
+            if pair in cleaned_lines:
+                deleted_lines[i] = ''
+                deleted_lines[i + 1] = ''
+                deleted_lines[i + 2] = ''
+                deleted_lines[i + 3] = ''
+                i += 4
+            else:
+                i += 1
+
+        del_name = f'удаленные_{message.document.file_name}'
+        del_path = os.path.join(OUTPUT_DIR, del_name)
+        with open(del_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(deleted_lines))
+        with open(del_path, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption="🗑️ Удалённые строки:")
+
+        bot.send_message(message.chat.id, f"📌 Кол-во ФИО: {len(cleaned_lines)}")
+        bot.send_message(message.chat.id, f"📌 Кол-во строк в файле: {len(file_lines)}")
+        send_mode_selection(message.chat.id)
+
+bot.polling(none_stop=True)
+        
